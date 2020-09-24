@@ -23,44 +23,47 @@ NUM_WORKERS = 4
 VAL_SIZE = 256
 CROP_SIZE = 224
 
+
 class HybridTrainPipe(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, data_dir, crop, dali_cpu=False, local_rank=0, world_size=1):
+    def __init__(self, batch_size, num_threads, device_id, data_dir, crop_size, local_rank=0, world_size=1):
         super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
         dali_device = "gpu"
         self.input = ops.FileReader(file_root=data_dir, shard_id=local_rank, num_shards=world_size, random_shuffle=True)
         self.decode = ops.ImageDecoder(device="mixed", output_type=types.RGB)
-        self.res = ops.RandomResizedCrop(device="gpu", size=crop, random_area=[0.08, 1.25])
-        self.cmnp = ops.CropMirrorNormalize(device="gpu",
-                                            output_dtype=types.FLOAT,
-                                            output_layout=types.NCHW,
-                                            image_type=types.RGB,
-                                            mean=[0.485 * 255, 0.456 * 255, 0.406 * 255],
-                                            std=[0.229 * 255, 0.224 * 255, 0.225 * 255])
-        self.coin = ops.CoinFlip(probability=0.5)
-        print('DALI "{0}" variant'.format(dali_device))
+        self.rand_resize_crop = ops.RandomResizedCrop(device=dali_device, size=crop_size, random_area=[0.08, 1.25])
+        self.crop_mirror_norm = ops.CropMirrorNormalize(device=dali_device,
+                                                        output_dtype=types.FLOAT,
+                                                        output_layout=types.NCHW,
+                                                        mean=[0.485, 0.456, 0.406],
+                                                        std=[0.229, 0.224, 0.225])
+        self.coin_flip = ops.CoinFlip(probability=0.5)
+        # print('DALI "{0}" variant'.format(dali_device))
 
     def define_graph(self):
-        rng = self.coin()
-        self.jpegs, self.labels = self.input(name="Reader")
-        images = self.decode(self.jpegs)
-        images = self.res(images)
-        output = self.cmnp(images, mirror=rng)
-        return [output, self.labels]
+        jpegs, labels = self.input(name="Reader")
+        images = self.decode(jpegs)
+        images = self.rand_resize_crop(images)
+        mirror_mask = self.coin_flip()
+        images = self.crop_mirror_norm(images, mirror=mirror_mask)
+        return [images, labels]
 
 
 class HybridValPipe(Pipeline):
     def __init__(self, batch_size, num_threads, device_id, data_dir, crop, size, local_rank=0, world_size=1):
-        super(HybridValPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
+        super(HybridValPipe, self).__init__(batch_size,
+                                            num_threads, device_id, seed=12 + device_id)
         self.input = ops.FileReader(file_root=data_dir, shard_id=local_rank, num_shards=world_size,
                                     random_shuffle=False)
         self.decode = ops.ImageDecoder(device="mixed", output_type=types.RGB)
-        self.res = ops.Resize(device="gpu", resize_shorter=size, interp_type=types.INTERP_TRIANGULAR)
+        self.res = ops.Resize(device="gpu", resize_shorter=size,
+                              interp_type=types.INTERP_TRIANGULAR)
         self.cmnp = ops.CropMirrorNormalize(device="gpu",
                                             output_dtype=types.FLOAT,
                                             output_layout=types.NCHW,
                                             crop=(crop, crop),
                                             image_type=types.RGB,
-                                            mean=[0.485 * 255, 0.456 * 255, 0.406 * 255],
+                                            mean=[0.485 * 255, 0.456 *
+                                                  255, 0.406 * 255],
                                             std=[0.229 * 255, 0.224 * 255, 0.225 * 255])
 
     def define_graph(self):
@@ -73,10 +76,14 @@ class HybridValPipe(Pipeline):
 
 if __name__ == '__main__':
     # iteration of DALI dataloader
-    pip_train = HybridTrainPipe(batch_size=TRAIN_BS, num_threads=NUM_WORKERS, device_id=0, data_dir=IMG_DIR+'/train', crop=CROP_SIZE, world_size=1, local_rank=0)
-    pip_test = HybridValPipe(batch_size=TEST_BS, num_threads=NUM_WORKERS, device_id=0, data_dir=IMG_DIR+'/val', crop=CROP_SIZE, size=VAL_SIZE, world_size=1, local_rank=0)
-    train_loader = DALIDataloader(pipeline=pip_train, size=IMAGENET_IMAGES_NUM_TRAIN, batch_size=TRAIN_BS, onehot_label=True)
-    test_loader = DALIDataloader(pipeline=pip_test, size=IMAGENET_IMAGES_NUM_TEST, batch_size=TEST_BS, onehot_label=True)
+    pip_train = HybridTrainPipe(batch_size=TRAIN_BS, num_threads=NUM_WORKERS, device_id=0,
+                                data_dir=IMG_DIR+'/train', crop=CROP_SIZE, world_size=1, local_rank=0)
+    pip_test = HybridValPipe(batch_size=TEST_BS, num_threads=NUM_WORKERS, device_id=0,
+                             data_dir=IMG_DIR+'/val', crop=CROP_SIZE, size=VAL_SIZE, world_size=1, local_rank=0)
+    train_loader = DALIDataloader(
+        pipeline=pip_train, size=IMAGENET_IMAGES_NUM_TRAIN, batch_size=TRAIN_BS, onehot_label=True)
+    test_loader = DALIDataloader(
+        pipeline=pip_test, size=IMAGENET_IMAGES_NUM_TEST, batch_size=TEST_BS, onehot_label=True)
     # print("[DALI] train dataloader length: %d"%len(train_loader))
     # print('[DALI] start iterate train dataloader')
     # start = time.time()
@@ -87,7 +94,7 @@ if __name__ == '__main__':
     # train_time = end-start
     # print('[DALI] end train dataloader iteration')
 
-    print("[DALI] test dataloader length: %d"%len(test_loader))
+    print("[DALI] test dataloader length: %d" % len(test_loader))
     print('[DALI] start iterate test dataloader')
     start = time.time()
     for i, data in enumerate(test_loader):
@@ -99,24 +106,27 @@ if __name__ == '__main__':
     # print('[DALI] iteration time: %fs [train],  %fs [test]' % (train_time, test_time))
     print('[DALI] iteration time: %fs [test]' % (test_time))
 
-
     # iteration of PyTorch dataloader
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop(CROP_SIZE, scale=(0.08, 1.25)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
+                             0.229, 0.224, 0.225]),
     ])
     train_dst = datasets.ImageFolder(IMG_DIR+'/train', transform_train)
-    train_loader = torch.utils.data.DataLoader(train_dst, batch_size=TRAIN_BS, shuffle=True, pin_memory=True, num_workers=NUM_WORKERS)
+    train_loader = torch.utils.data.DataLoader(
+        train_dst, batch_size=TRAIN_BS, shuffle=True, pin_memory=True, num_workers=NUM_WORKERS)
     transform_test = transforms.Compose([
         transforms.Resize(VAL_SIZE),
         transforms.CenterCrop(CROP_SIZE),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
+                             0.229, 0.224, 0.225]),
     ])
     test_dst = datasets.ImageFolder(IMG_DIR+'/val', transform_test)
-    test_iter = torch.utils.data.DataLoader(test_dst, batch_size=TEST_BS, shuffle=False, pin_memory=True, num_workers=NUM_WORKERS)
+    test_iter = torch.utils.data.DataLoader(
+        test_dst, batch_size=TEST_BS, shuffle=False, pin_memory=True, num_workers=NUM_WORKERS)
     # print("[PyTorch] train dataloader length: %d"%len(train_loader))
     # print('[PyTorch] start iterate train dataloader')
     # start = time.time()
@@ -127,7 +137,7 @@ if __name__ == '__main__':
     # train_time = end-start
     # print('[PyTorch] end train dataloader iteration')
 
-    print("[PyTorch] test dataloader length: %d"%len(test_loader))
+    print("[PyTorch] test dataloader length: %d" % len(test_loader))
     print('[PyTorch] start iterate test dataloader')
     start = time.time()
     for i, data in enumerate(test_loader):
